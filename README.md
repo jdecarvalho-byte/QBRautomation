@@ -121,8 +121,3 @@ The SQL queries do all the heavy lifting (aggregation, YoY calculation, Total GS
 | SQL queries | Igor | Query logic, parametrization, GROUPING SETS, new metrics |
 | Python / PPTX | João | Number formatting, slide population, template mapping |
 
----
-
-## Inspired By
-
-This project follows the same pattern as the MBR Automation by Samuel Sorensen, adapted for the GSA Pilot data and simplified to use fewer, more complete SQL queries.
