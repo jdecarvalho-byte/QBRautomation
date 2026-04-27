@@ -1,0 +1,481 @@
+# %% [markdown]
+# # GSA QBR - TAE Pilot Performance Automation
+# 
+# Automates Slide 7 (TAE Pilot Performance) in the GSA QBR deck.
+# 
+# **Steps:**
+# 1. Connect to Darwin
+# 2. Run 2 SQL queries → `pilot_master` and `renewal_core_master`
+# 3. Format the numbers and write them into the PowerPoint table
+
+# %% [markdown]
+# ## Step 1: Setup
+
+# %%
+%reload_ext linkedin.lisql
+%manage_trino holdem
+
+# %%
+import re, math
+from pathlib import Path
+import pandas as pd
+from pptx import Presentation
+from pptx.enum.text import PP_ALIGN
+
+# === PATHS ===
+# If running from the repo folder, use Path('.') as BASE_DIR
+# If running from Darwin, update to your clone path
+BASE_DIR = Path('/home/jovyan/storage/git/QBRautomation')
+TEMPLATE = BASE_DIR / 'GSA_QBR_Template_Slide7.pptx'
+OUTPUT   = BASE_DIR / 'GSA_QBR_Slide7_populated.pptx'
+
+# If the template is ONLY slide 7 (1 slide), use SLIDE_INDEX = 0
+# If the template is the full 28-slide deck, use SLIDE_INDEX = 6
+SLIDE_INDEX = 6          # Change to 6 if using the full deck
+TABLE_NAME  = 'Table 11' # Name of the table shape in the slide
+
+# %%
+from datetime import date
+
+today = date.today()
+
+# LinkedIn fiscal year starts in June
+# Jun-Aug = Q1, Sep-Nov = Q2, Dec-Feb = Q3, Mar-May = Q4
+month = today.month
+if month >= 6 and month <= 8:
+    current_fq, current_fy = 1, today.year + 1
+elif month >= 9 and month <= 11:
+    current_fq, current_fy = 2, today.year + 1
+elif month == 12:
+    current_fq, current_fy = 3, today.year + 1
+elif month <= 2:
+    current_fq, current_fy = 3, today.year
+else:  # Mar-May
+    current_fq, current_fy = 4, today.year
+
+# Prior quarter = one quarter back
+if current_fq > 1:
+    prior_fq, prior_fy = current_fq - 1, current_fy
+else:
+    prior_fq, prior_fy = 4, current_fy - 1
+
+# YoY = same quarter, prior fiscal year
+yoy_fq, yoy_fy = current_fq, current_fy - 1
+
+current_q = f"Q{current_fq} FY{str(current_fy)[2:]}"
+prior_q   = f"Q{prior_fq} FY{str(prior_fy)[2:]}"
+yoy_q     = f"Q{yoy_fq} FY{str(yoy_fy)[2:]}"
+
+print(f"Current: {current_q} | Prior: {prior_q} | YoY: {yoy_q}")
+
+# %% [markdown]
+# ## Step 2: SQL Queries
+# 
+# Two queries that deliver everything pre-calculated:
+# - **pilot_master** → metrics 1-5 (pilots, ASPs, discount, duration, % of TAE)
+# - **renewal_core_master** → metrics 6-7 (renewal conversion, renewal RIG)
+# 
+# Both include NAMER, EMEAL, and TOTAL rows via `GROUPING SETS`.
+# Timeframes (Current / Prior / YoY) are auto-detected from `current_date`.
+
+# %%
+%%sql pilot_master <<
+
+WITH base_data AS (
+    SELECT 
+        CASE 
+            WHEN xlob.top_level_sales_region IN ('EMEA', 'LATAM') THEN 'EMEAL'
+            ELSE xlob.top_level_sales_region 
+        END AS region,
+        prod.opportunity_urn,
+        xlob.field_booking_amount_usd_yearly,
+        prod.opportunity_contract_term_months,
+        xlob.opportunity_type,
+        xlob.opp_count_flag,
+        CASE 
+            WHEN UPPER(prod.product_name) LIKE '%LIHA MIDDLE%' 
+            THEN (COALESCE(prod.discount_amount_local, 0) - (prod.total_list_amount_local * 0.5425)) * (total_list_amount_fx_neutral / total_list_amount_local) 
+            ELSE prod.discount_amount_fx_neutral 
+        END AS discount_amount_fx_neutral,
+        prod.total_list_amount_fx_neutral,
+        CASE -- Period identity tag
+            WHEN (xlob.fiscal_year, xlob.fiscal_quarter) = (SELECT fiscal_year, fiscal_quarter FROM u_salesbi.xlob_bookings WHERE date_sk = current_date LIMIT 1) THEN 'Current'
+            WHEN (xlob.fiscal_year, xlob.fiscal_quarter) = (SELECT fiscal_year, fiscal_quarter FROM u_salesbi.xlob_bookings WHERE date_sk = current_date - INTERVAL '3' MONTH LIMIT 1) THEN 'Prior'
+            WHEN (xlob.fiscal_year, xlob.fiscal_quarter) = (SELECT fiscal_year, fiscal_quarter FROM u_salesbi.xlob_bookings WHERE date_sk = current_date - INTERVAL '1' YEAR LIMIT 1) AND xlob.date_sk <= current_date - INTERVAL '1' YEAR THEN 'YoY'
+        END AS timeframe
+    FROM u_salesbi.xlob_bookings xlob
+    JOIN u_salesbi.saas_opportunity_line_item prod 
+        ON xlob.opportunity_urn = prod.opportunity_urn
+        AND xlob.product_name = prod.product_name
+    WHERE xlob.date_sk >= date_trunc('month', current_date - INTERVAL '15' MONTH)
+        AND xlob.status = 'Closed Won'
+        AND xlob.plan_opp_type = 'TAE'
+        AND xlob.sales_org = 'GSA'
+),
+
+opp_level AS (
+    SELECT
+        region,
+        opportunity_urn,
+        timeframe,
+        opportunity_type,
+        opp_count_flag,
+        SUM(field_booking_amount_usd_yearly) AS field_bookings,
+        SUM(discount_amount_fx_neutral) / NULLIF(SUM(total_list_amount_fx_neutral), 0) AS discount_pct,
+        MAX(opportunity_contract_term_months) AS contract_term_months
+    FROM base_data
+    WHERE timeframe IS NOT NULL
+    GROUP BY region, opportunity_urn, timeframe, opportunity_type, opp_count_flag
+),
+
+aggregated_data AS (
+    SELECT       
+        COALESCE(region, 'TOTAL') AS region, -- Pilot counts
+        COUNT(DISTINCT CASE WHEN timeframe = 'Prior' AND UPPER(opportunity_type) = 'PILOT' AND opp_count_flag = 1 THEN opportunity_urn END) AS pilots_prior,          
+        COUNT(DISTINCT CASE WHEN timeframe = 'Current' AND UPPER(opportunity_type) = 'PILOT' AND opp_count_flag = 1 THEN opportunity_urn END) AS pilots_current,
+        COUNT(DISTINCT CASE WHEN timeframe = 'YoY' AND UPPER(opportunity_type) = 'PILOT' AND opp_count_flag = 1 THEN opportunity_urn END) AS pilots_yoy,
+        -- Pilot bookings
+        SUM(CASE WHEN timeframe = 'Prior' AND UPPER(opportunity_type) = 'PILOT' THEN field_bookings END) AS bk_prior,            
+        SUM(CASE WHEN timeframe = 'Current' AND UPPER(opportunity_type) = 'PILOT' THEN field_bookings END) AS bk_current,
+        SUM(CASE WHEN timeframe = 'YoY' AND UPPER(opportunity_type) = 'PILOT' THEN field_bookings END) AS bk_yoy,
+        -- Discount
+        AVG(CASE WHEN timeframe = 'Prior' AND UPPER(opportunity_type) = 'PILOT' AND opp_count_flag = 1 THEN discount_pct END) AS disc_prior,         
+        AVG(CASE WHEN timeframe = 'Current' AND UPPER(opportunity_type) = 'PILOT' AND opp_count_flag = 1 THEN discount_pct END) AS disc_current, 
+        AVG(CASE WHEN timeframe = 'YoY' AND UPPER(opportunity_type) = 'PILOT' AND opp_count_flag = 1 THEN discount_pct END) AS disc_yoy,
+        -- Duration
+        AVG(CASE WHEN timeframe = 'Prior' AND UPPER(opportunity_type) = 'PILOT' AND opp_count_flag = 1 THEN contract_term_months END) AS dur_prior,
+        AVG(CASE WHEN timeframe = 'Current' AND UPPER(opportunity_type) = 'PILOT' AND opp_count_flag = 1 THEN contract_term_months END) AS dur_current,
+        AVG(CASE WHEN timeframe = 'YoY' AND UPPER(opportunity_type) = 'PILOT' AND opp_count_flag = 1 THEN contract_term_months END) AS dur_yoy,
+        -- TAE total bookings (ALL opp types — needed for % of TAE calc)
+        SUM(CASE WHEN timeframe = 'Prior' THEN field_bookings END) AS tae_bk_prior,
+        SUM(CASE WHEN timeframe = 'Current' THEN field_bookings END) AS tae_bk_current,
+        SUM(CASE WHEN timeframe = 'YoY' THEN field_bookings END) AS tae_bk_yoy
+    FROM opp_level
+    WHERE timeframe IS NOT NULL
+    GROUP BY GROUPING SETS ((region), ())
+)
+
+SELECT 
+    region,
+    -- Pilots
+    pilots_prior, pilots_current,
+    (pilots_current - pilots_yoy) * 1.0 / NULLIF(pilots_yoy, 0) AS pilots_yoy_pct,
+    -- ASP ($K)
+    (bk_prior / NULLIF(pilots_prior, 0)) / 1000.0 AS asp_prior_k,
+    (bk_current / NULLIF(pilots_current, 0)) / 1000.0 AS asp_current_k,
+    ((bk_current / NULLIF(pilots_current, 0)) - (bk_yoy / NULLIF(pilots_yoy, 0))) / NULLIF((bk_yoy / NULLIF(pilots_yoy, 0)), 0) AS asp_yoy_pct,
+    -- Discount (YoY in ppt)
+    disc_prior, disc_current,
+    (disc_current - disc_yoy) * 100.0 AS disc_yoy_ppt,
+    -- Duration (YoY in %)
+    dur_prior, dur_current,
+    (dur_current - dur_yoy) / NULLIF(dur_yoy, 0) AS dur_yoy_pct,
+    -- Pilot Bookings % of TAE
+    bk_prior / NULLIF(tae_bk_prior, 0) AS pct_tae_prior,
+    bk_current / NULLIF(tae_bk_current, 0) AS pct_tae_current,
+    (bk_current / NULLIF(tae_bk_current, 0) - bk_yoy / NULLIF(tae_bk_yoy, 0)) * 100.0 AS pct_tae_yoy_ppt
+FROM aggregated_data
+ORDER BY CASE WHEN region = 'TOTAL' THEN 2 ELSE 1 END, region
+
+# %%
+%%sql renewal_core_master <<
+
+WITH base_data AS (
+    SELECT 
+        CASE 
+            WHEN xlob.top_level_sales_region IN ('EMEA', 'LATAM') THEN 'EMEAL'
+            ELSE xlob.top_level_sales_region 
+        END AS region,
+        xlob.opportunity_urn,
+        xlob.status,
+        xlob.opp_count_flag,
+        xlob.renewal_target_amount_usd,
+        xlob.field_booking_amount_usd_yearly,
+        CASE 
+            WHEN (xlob.fiscal_year, xlob.fiscal_quarter) = (SELECT fiscal_year, fiscal_quarter FROM u_salesbi.xlob_bookings WHERE date_sk = current_date LIMIT 1) THEN 'Current'
+            WHEN (xlob.fiscal_year, xlob.fiscal_quarter) = (SELECT fiscal_year, fiscal_quarter FROM u_salesbi.xlob_bookings WHERE date_sk = current_date - INTERVAL '3' MONTH LIMIT 1) THEN 'Prior'
+            WHEN (xlob.fiscal_year, xlob.fiscal_quarter) = (SELECT fiscal_year, fiscal_quarter FROM u_salesbi.xlob_bookings WHERE date_sk = current_date - INTERVAL '1' YEAR LIMIT 1) AND xlob.date_sk <= current_date - INTERVAL '1' YEAR THEN 'YoY'
+        END AS timeframe
+    FROM u_salesbi.xlob_bookings xlob
+    WHERE xlob.date_sk >= date_trunc('month', current_date - INTERVAL '15' MONTH)
+        AND xlob.status IN ('Closed Won', 'Closed Disengaged')
+        AND UPPER(xlob.opportunity_type) = 'PILOT RENEWAL'
+        AND xlob.plan_opp_type = 'TAE'
+        AND xlob.sales_org = 'GSA'
+),
+
+aggregated_data AS (
+    SELECT 
+        COALESCE(region, 'TOTAL') AS region,
+        COUNT(DISTINCT CASE WHEN timeframe = 'Prior' AND opp_count_flag = 1 THEN opportunity_urn END) AS ret_total_prior,
+        COUNT(DISTINCT CASE WHEN timeframe = 'Current' AND opp_count_flag = 1 THEN opportunity_urn END) AS ret_total_current,
+        COUNT(DISTINCT CASE WHEN timeframe = 'YoY' AND opp_count_flag = 1 THEN opportunity_urn END) AS ret_total_yoy,
+        COUNT(DISTINCT CASE WHEN timeframe = 'Prior' AND opp_count_flag = 1 AND status = 'Closed Won' THEN opportunity_urn END) AS ret_won_prior,
+        COUNT(DISTINCT CASE WHEN timeframe = 'Current' AND opp_count_flag = 1 AND status = 'Closed Won' THEN opportunity_urn END) AS ret_won_current,
+        COUNT(DISTINCT CASE WHEN timeframe = 'YoY' AND opp_count_flag = 1 AND status = 'Closed Won' THEN opportunity_urn END) AS ret_won_yoy,
+        SUM(CASE WHEN timeframe = 'Prior' THEN renewal_target_amount_usd END) AS rta_prior,
+        SUM(CASE WHEN timeframe = 'Current' THEN renewal_target_amount_usd END) AS rta_current,
+        SUM(CASE WHEN timeframe = 'YoY' THEN renewal_target_amount_usd END) AS rta_yoy,  
+        SUM(CASE WHEN timeframe = 'Prior' THEN field_booking_amount_usd_yearly END) AS bk_prior,
+        SUM(CASE WHEN timeframe = 'Current' THEN field_booking_amount_usd_yearly END) AS bk_current,
+        SUM(CASE WHEN timeframe = 'YoY' THEN field_booking_amount_usd_yearly END) AS bk_yoy
+    FROM base_data
+    WHERE timeframe IS NOT NULL
+    GROUP BY GROUPING SETS ((region), ())
+)
+
+SELECT 
+    region,
+    -- Renewal Conversion %
+    (ret_won_prior * 1.0 / NULLIF(ret_total_prior, 0)) AS ret_prior,
+    (ret_won_current * 1.0 / NULLIF(ret_total_current, 0)) AS ret_current,
+    ((ret_won_current * 1.0 / NULLIF(ret_total_current, 0)) - (ret_won_yoy * 1.0 / NULLIF(ret_total_yoy, 0))) * 100.0 AS ret_yoy_ppt,
+    -- Renewal RIG
+    (bk_prior / NULLIF(rta_prior, 0)) AS rig_prior,
+    (bk_current / NULLIF(rta_current, 0)) AS rig_current,
+    ((bk_current / NULLIF(rta_current, 0)) - (bk_yoy / NULLIF(rta_yoy, 0))) * 100.0 AS rig_yoy_ppt
+FROM aggregated_data
+ORDER BY CASE WHEN region = 'TOTAL' THEN 2 ELSE 1 END, region
+
+# %% [markdown]
+# ## Step 3: Populate the PowerPoint
+# 
+# All the math is done in SQL. This cell just:
+# 1. Reads the two DataFrames from above
+# 2. Formats numbers for display (e.g. `0.19` → `19%`)
+# 3. Writes each value into the correct cell of the slide table
+
+# %%
+# =================================================================
+# 1. GRAB THE SQL RESULTS AS DATAFRAMES
+# =================================================================
+
+def to_df(sql_result):
+    """%%sql result → pandas DataFrame."""
+    if hasattr(sql_result, 'DataFrame'):
+        return sql_result.DataFrame()
+    return pd.DataFrame(sql_result)
+
+pm = to_df(pilot_master)          # metrics 1-5
+rc = to_df(renewal_core_master)   # metrics 6-7
+pm.columns = pm.columns.str.lower().str.strip()
+rc.columns = rc.columns.str.lower().str.strip()
+
+print('pilot_master:');          print(pm.to_string(index=False))
+print('\nrenewal_core_master:'); print(rc.to_string(index=False))
+
+# %%
+# =================================================================
+# 2. NUMBER FORMATTERS
+#    Each function takes a raw value and returns the display string.
+# =================================================================
+
+def safe(v):
+    """Convert to float safely. Returns None if invalid."""
+    try:
+        n = float(v)
+        return None if math.isnan(n) or math.isinf(n) else n
+    except (TypeError, ValueError):
+        return None
+
+def fmt_count(v):    # 1706  → '1,706'
+    n = safe(v); return f'{int(round(n)):,}' if n is not None else ''
+
+def fmt_dollar_k(v): # 13.4  → '$13.4'
+    n = safe(v); return f'${n:,.1f}' if n is not None else ''
+
+def fmt_pct(v):      # 0.19  → '19%'
+    n = safe(v); return f'{n*100:.0f}%' if n is not None else ''
+
+def fmt_dec1(v):     # 5.35  → '5.4'
+    n = safe(v); return f'{n:.1f}' if n is not None else ''
+
+def fmt_dec2(v):     # 0.693 → '0.69'
+    n = safe(v); return f'{n:.2f}' if n is not None else ''
+
+def fmt_yoy_pct(v):  # 0.06  → '+6%'   |  -0.28 → '-28%'
+    n = safe(v)
+    if n is None: return ''
+    p = int(round(n * 100))
+    return f'+{p}%' if p > 0 else (f'{p}%' if p < 0 else '0%')
+
+def fmt_yoy_ppt(v):  # -3.0  → '-3ppt'  |  0.0 → '0'
+    n = safe(v)
+    if n is None: return ''
+    p = int(round(n))
+    return f'+{p}ppt' if p > 0 else (f'{p}ppt' if p < 0 else '0')
+
+# %%
+# =================================================================
+# 3. MAPPING: which SQL column goes into which slide cell
+# =================================================================
+#
+# The slide table (22 columns):
+#
+#   Col 0       = Row label (NAMER / EMEAL / Total GSA)
+#   Cols 1-3    = # of Paid Pilots      [prior, current, yoy]
+#   Cols 4-6    = Pilot ASPs ($K)       [prior, current, yoy]
+#   Cols 7-9    = Avg. Discount         [prior, current, yoy]
+#   Cols 10-12  = Avg. Duration         [prior, current, yoy]
+#   Cols 13-15  = Pilot Bookings % TAE  [prior, current, yoy]
+#   Cols 16-18  = Renewal Conversion %  [prior, current, yoy]
+#   Cols 19-21  = Pilot Renewal RIG     [prior, current, yoy]
+#
+# CELL_MAP format:
+#   (col_group, sql_col_prior, sql_col_current, sql_col_yoy, fmt_values, fmt_yoy, dataframe)
+#
+# col_group = which 3-column block in the table (0 = first metric, 1 = second, etc.)
+# The actual column index is calculated as: 1 + (col_group * 3)
+
+CELL_MAP = [
+    #  group  prior              current             yoy                 fmt_values   fmt_yoy      source
+    (  0,     'pilots_prior',    'pilots_current',   'pilots_yoy_pct',   fmt_count,   fmt_yoy_pct, 'pm'  ),  # # of Paid Pilots
+    (  1,     'asp_prior_k',     'asp_current_k',    'asp_yoy_pct',      fmt_dollar_k,fmt_yoy_pct, 'pm'  ),  # Pilot ASPs ($K)
+    (  2,     'disc_prior',      'disc_current',     'disc_yoy_ppt',     fmt_pct,     fmt_yoy_ppt, 'pm'  ),  # Avg. Discount
+    (  3,     'dur_prior',       'dur_current',      'dur_yoy_pct',      fmt_dec1,    fmt_yoy_pct, 'pm'  ),  # Avg. Duration
+    (  4,     'pct_tae_prior',   'pct_tae_current',  'pct_tae_yoy_ppt',  fmt_pct,    fmt_yoy_ppt, 'pm'  ),  # Bookings % of TAE
+    (  5,     'ret_prior',       'ret_current',      'ret_yoy_ppt',      fmt_pct,     fmt_yoy_ppt, 'rc'  ),  # Renewal Conversion
+    (  6,     'rig_prior',       'rig_current',      'rig_yoy_ppt',      fmt_dec2,    fmt_yoy_ppt, 'rc'  ),  # Renewal RIG
+]
+
+# Which SQL region value maps to which row label in the slide
+ROWS = {
+    'NAMER': 'namer',
+    'EMEAL': 'emeal',
+    'TOTAL': 'total gsa',
+}
+
+# %%
+# =================================================================
+# 4. POPULATE THE POWERPOINT TABLE
+# =================================================================
+
+from pptx.dml.color import RGBColor
+
+# Load the template
+prs = Presentation(str(TEMPLATE))
+slide = prs.slides[SLIDE_INDEX]
+
+# Find the table shape
+table = None
+for shape in slide.shapes:
+    if shape.has_table and shape.name == TABLE_NAME:
+        table = shape.table
+        break
+assert table is not None, f'Table "{TABLE_NAME}" not found on slide {SLIDE_INDEX + 1}!'
+print(f'Found table: {len(table.rows)} rows x {len(table.columns)} cols')
+
+# Get DataFrames
+dfs = {'pm': pm, 'rc': rc}
+
+# =================================================================
+# UPDATE HEADER ROW 1 WITH CURRENT QUARTER LABELS
+# =================================================================
+# Row 0 = metric names (merged cells) — don't touch
+# Row 1 = quarter labels (prior, current QTD, YoY)
+
+for col_group in range(7):
+    base = 1 + (col_group * 3)
+    table.cell(1, base).text = prior_q
+    table.cell(1, base + 1).text = f"{current_q} QTD"
+    table.cell(1, base + 2).text = 'YoY'
+    for col_idx in [base, base + 1, base + 2]:
+        for paragraph in table.cell(1, col_idx).text_frame.paragraphs:
+            paragraph.alignment = PP_ALIGN.CENTER
+
+print(f'Headers updated: {prior_q} | {current_q} QTD | YoY')
+
+# =================================================================
+# FIND DATA ROWS (start from row 2, since 0-1 are headers)
+# =================================================================
+
+norm = lambda t: re.sub(r'[^a-z0-9]+', ' ', t.strip().lower()).strip()
+row_for = {}
+for r in range(2, len(table.rows)):
+    label = norm(table.cell(r, 0).text)
+    if 'namer' in label:                       row_for['namer'] = r
+    if 'emea' in label:                        row_for['emeal'] = r
+    if 'total' in label and 'gsa' in label:    row_for['total gsa'] = r
+print(f'Rows found: {row_for}')
+
+# =================================================================
+# FILL EVERY CELL
+# =================================================================
+
+filled = 0
+
+for region_sql, region_label in ROWS.items():
+    r = row_for.get(region_label)
+    if r is None:
+        print(f'  WARNING: row "{region_label}" not found in table')
+        continue
+
+    for col_group, col_prior, col_current, col_yoy, fmt_vals, fmt_yoy_func, source_df in CELL_MAP:
+        df = dfs[source_df]
+        match = df[df['region'] == region_sql]
+        if match.empty:
+            print(f'  WARNING: no {region_sql} data in {source_df}')
+            continue
+
+        row_data = match.iloc[0]
+        base = 1 + (col_group * 3)
+
+        # Write prior
+        prior_cell = table.cell(r, base)
+        prior_cell.text = fmt_vals(row_data.get(col_prior))
+        prior_cell.text_frame.paragraphs[0].alignment = PP_ALIGN.CENTER
+
+        # Write current
+        current_cell = table.cell(r, base + 1)
+        current_cell.text = fmt_vals(row_data.get(col_current))
+        current_cell.text_frame.paragraphs[0].alignment = PP_ALIGN.CENTER
+
+        # Write YoY
+        yoy_cell = table.cell(r, base + 2)
+        yoy_cell.text = fmt_yoy_func(row_data.get(col_yoy))
+        yoy_cell.text_frame.paragraphs[0].alignment = PP_ALIGN.CENTER
+
+        # Color code YoY: green positive, red negative
+        raw_yoy_value = safe(row_data.get(col_yoy))
+        if raw_yoy_value is not None:
+            if raw_yoy_value > 0:
+                yoy_cell.fill.solid()
+                yoy_cell.fill.fore_color.rgb = RGBColor(222, 241, 211)
+            elif raw_yoy_value < 0:
+                yoy_cell.fill.solid()
+                yoy_cell.fill.fore_color.rgb = RGBColor(255, 171, 171)
+
+        filled += 3
+
+# Save the output
+prs.save(str(OUTPUT))
+print(f'\nDone! {filled} cells populated.')
+print(f'Saved to: {OUTPUT}')
+
+# %%
+import time
+time.sleep(2)
+
+# %%
+from linkedin.mail.liemail import LiEmail
+from datetime import date
+
+sender = 'jdecarvalho@linkedin.com'
+recipients = ['jdecarvalho@linkedin.com', 'icarneiro@linkedin.com']
+pull_date = date.today().strftime('%B %d, %Y')
+
+with LiEmail() as email:
+    email.sender = sender
+    email.recipients = recipients
+    email.subject = 'GSA QBR - Slide 7 Populated'
+    email.email_body = (
+        f'Hi team,\n\n'
+        f'Please find attached the GSA QBR deck with Slide 7 populated automatically.\n\n'
+        f'Note: QTD info is as of {pull_date}. Based on TAEs only.'
+    )
+    email.attach_file(str(OUTPUT), 'GSA_QBR_Slide7_populated.pptx')
+    email.send_email()
+
+print('Email sent!')
+
+
